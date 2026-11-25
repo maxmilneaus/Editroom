@@ -120,6 +120,82 @@ final class MagicAgent: ObservableObject {
         }
     }
 
+    /// Where the person's Codex sends its requests: a model catalog and base URL set in ~/.codex/config.toml
+    /// (for a router or custom provider). Magic runs Codex with `--ignore-user-config`, so plugins, hooks and
+    /// other MCP servers stay out of an edit; these two settings are the only ones passed through.
+    struct CodexRouting: Equatable {
+        var catalog: URL?
+        var baseURL: String?
+    }
+
+    private static var routingCache: (stamp: Date?, value: CodexRouting)?
+    private static var modelsCache: (path: String, stamp: Date?, models: [[String: Any]])?
+
+    private static var codexHome: URL { FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex", isDirectory: true) }
+
+    private static func modified(_ url: URL) -> Date? {
+        (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
+    }
+
+    static var codexRouting: CodexRouting {
+        let config = codexHome.appendingPathComponent("config.toml")
+        let stamp = modified(config)
+        if let c = routingCache, c.stamp == stamp { return c.value }
+        var value = CodexRouting()
+        if let text = try? String(contentsOf: config, encoding: .utf8) {
+            let keys = topLevelStrings(text)
+            if let c = keys["model_catalog_json"], !c.isEmpty {
+                let path = (c as NSString).expandingTildeInPath
+                let url = path.hasPrefix("/") ? URL(fileURLWithPath: path) : codexHome.appendingPathComponent(path)
+                if FileManager.default.fileExists(atPath: url.path) { value.catalog = url }
+            }
+            if let b = keys["openai_base_url"], b.hasPrefix("http://") || b.hasPrefix("https://") { value.baseURL = b }
+        }
+        routingCache = (stamp, value)
+        return value
+    }
+
+    /// Top-level `key = "string"` and `key = 'string'` pairs of a TOML file, before its first table.
+    static func topLevelStrings(_ text: String) -> [String: String] {
+        var values: [String: String] = [:]
+        for raw in text.components(separatedBy: .newlines) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.hasPrefix("[") { break }
+            guard !line.hasPrefix("#"), let eq = line.firstIndex(of: "=") else { continue }
+            let key = line[..<eq].trimmingCharacters(in: .whitespaces)
+            var rest = Substring(line[line.index(after: eq)...].trimmingCharacters(in: .whitespaces))
+            guard let quote = rest.first, quote == "\"" || quote == "'" else { continue }
+            rest = rest.dropFirst()
+            var out = ""
+            var escaped = false
+            var closed = false
+            for ch in rest {
+                if quote == "\"", escaped { out.append(ch == "n" ? "\n" : ch == "t" ? "\t" : ch); escaped = false; continue }
+                if quote == "\"", ch == "\\" { escaped = true; continue }
+                if ch == quote { closed = true; break }
+                out.append(ch)
+            }
+            if closed { values[key] = out }
+        }
+        return values
+    }
+
+    /// Codex's model list: the catalog from its settings if there is one, else its own cache. Read again only when
+    /// the file changes.
+    private static func codexModels() -> [[String: Any]] {
+        let candidates = [codexRouting.catalog, codexHome.appendingPathComponent("models_cache.json")].compactMap { $0 }
+        for file in candidates {
+            let stamp = modified(file)
+            if let c = modelsCache, c.path == file.path, c.stamp == stamp { return c.models }
+            guard let data = try? Data(contentsOf: file),
+                  let models = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["models"] as? [[String: Any]],
+                  !models.isEmpty else { continue }
+            modelsCache = (file.path, stamp, models)
+            return models
+        }
+        return []
+    }
+
     /// The models each AI offers. ChatGPT's come from Codex's own list on this Mac.
     func models(for kind: Kind) -> [ModelOption] {
         switch kind {
@@ -130,24 +206,39 @@ final class MagicAgent: ObservableObject {
                 ("claude-haiku-5-5", "Haiku 5.5", "Fastest"), ("claude-fable-5-2", "Fable 5.2", "Most capable"),
             ].map { ModelOption(id: $0.0, name: $0.1, blurb: $0.2, efforts: efforts) }
         case .chatgpt:
-            // Just these, in this order. Names and efforts come from Codex's own list when it has them.
-            let picks = [("gpt-6.2-sol", "GPT-6.2-Sol"), ("gpt-6.2-astra", "GPT-6.2-Astra"),
-                         ("gpt-6.1-terra", "GPT-6.1-Terra"), ("gpt-6-luna", "GPT-6-Luna")]
-            let file = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/models_cache.json")
-            var known: [String: [String: Any]] = [:]
-            if let data = try? Data(contentsOf: file),
-               let models = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["models"] as? [[String: Any]] {
-                for m in models { if let slug = m["slug"] as? String { known[slug] = m } }
-            }
-            return picks.compactMap { slug, name in
-                let m = known[slug]
-                // Not listed by Codex on this Mac: this plan doesn't offer it.
-                if !known.isEmpty, m == nil { return nil }
+            // Codex's own list decides what's offered. These four lead, in this order; the rest follow as Codex
+            // orders them. Without a list (Codex never run), just the four.
+            let leading = [("gpt-6.2-sol", "GPT-6.2-Sol"), ("gpt-6.2-astra", "GPT-6.2-Astra"),
+                           ("gpt-6.1-terra", "GPT-6.1-Terra"), ("gpt-6-luna", "GPT-6-Luna")]
+            let defaults = ["low", "medium", "high", "xhigh"]
+            func efforts(_ m: [String: Any]) -> [String] {
                 // Not "ultra": it hands parts of the job to more agents, which costs much more.
-                let efforts = (m?["supported_reasoning_levels"] as? [[String: Any]])?.compactMap { $0["effort"] as? String }.filter { $0 != "ultra" }
-                return ModelOption(id: slug, name: name, efforts: efforts ?? ["low", "medium", "high", "xhigh"],
-                                   defaultEffort: m?["default_reasoning_level"] as? String ?? "medium")
+                ((m["supported_reasoning_levels"] as? [[String: Any]]) ?? []).compactMap { $0["effort"] as? String }.filter { $0 != "ultra" }
             }
+            func option(_ slug: String, _ fallbackName: String, _ m: [String: Any]?) -> ModelOption {
+                let e = m.map(efforts) ?? defaults
+                let name = (m?["display_name"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? fallbackName
+                let wanted = m?["default_reasoning_level"] as? String ?? "medium"
+                return ModelOption(id: slug, name: name, efforts: e,
+                                   defaultEffort: e.contains(wanted) ? wanted : e.contains("medium") ? "medium" : e.first ?? "")
+            }
+            // Pickable: listed (not "hide", which is internal), a chat model that reasons, each slug once.
+            let notForEditing = ["embedding", "image", "tts", "whisper", "transcribe", "realtime"]
+            var seen = Set<String>()
+            let listed = Self.codexModels().filter { m in
+                guard let slug = m["slug"] as? String, (m["visibility"] as? String ?? "list") == "list",
+                      !notForEditing.contains(where: { slug.lowercased().contains($0) }), !efforts(m).isEmpty else { return false }
+                return seen.insert(slug).inserted
+            }
+            if listed.isEmpty { return leading.map { option($0.0, $0.1, nil) } }
+            let bySlug = Dictionary(listed.map { ($0["slug"] as! String, $0) }, uniquingKeysWith: { a, _ in a })
+            let lead = Set(leading.map { $0.0 })
+            let first = leading.compactMap { slug, name in bySlug[slug].map { option(slug, name, $0) } }
+            let rest = listed.compactMap { m -> ModelOption? in
+                let slug = m["slug"] as! String
+                return lead.contains(slug) ? nil : option(slug, slug, m)
+            }
+            return first + rest
         }
     }
 
@@ -515,6 +606,9 @@ final class MagicAgent: ObservableObject {
                 "-c", "mcp_servers.editroom.startup_timeout_sec=30",
                 "-c", "approval_policy=\"never\"",
             ]
+            let routing = Self.codexRouting
+            if let catalog = routing.catalog { p.arguments! += ["-c", "model_catalog_json=" + AgentConnect.tomlString(catalog.path)] }
+            if let base = routing.baseURL { p.arguments! += ["-c", "openai_base_url=" + AgentConnect.tomlString(base)] }
             if !model(for: kind).isEmpty { p.arguments! += ["-m", model(for: kind)] }
             if !effort(for: kind).isEmpty { p.arguments! += ["-c", "model_reasoning_effort=\"\(effort(for: kind))\""] }
             p.arguments! += ["-"]

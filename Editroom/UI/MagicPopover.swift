@@ -365,7 +365,7 @@ private struct PromptForm: View {
                         ModelChip(ai: ai, kind: kind, manage: manage)
                         EffortChip(ai: ai, kind: kind)
                     }
-                    PlanNote(text: "Uses your \(kind.name) plan")
+                    PlanNote(text: kind == .chatgpt && MagicAgent.codexRouting.baseURL != nil ? "Uses your Codex model server" : "Uses your \(kind.name) plan")
                 }
                 Spacer()
                 PillButton(title: "Make it", prominent: true, action: go)
