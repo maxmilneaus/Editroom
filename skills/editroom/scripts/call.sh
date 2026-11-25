@@ -16,7 +16,8 @@ def post(body, sid=None):
     try:
         with urllib.request.urlopen(req, timeout=300) as r: return json.load(r), r.headers.get("Mcp-Session-Id")
     except urllib.error.HTTPError as e:
-        sys.exit("Editroom refused the call (HTTP %d). Turn on Settings > Magic > Let AI apps edit in Editroom." % e.code)
+        if e.code == 403: sys.exit("Editroom refused the call. Turn on Settings > Magic > Let AI apps edit in Editroom.")
+        sys.exit("Editroom answered HTTP %d: %s" % (e.code, e.read().decode(errors="replace")[:200]))
     except (urllib.error.URLError, OSError):
         sys.exit("Editroom isn't open (nothing at %s). Open it, or set EDITROOM_PORT." % url)
 _, sid = post({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "call.sh", "version": "1"}}})
