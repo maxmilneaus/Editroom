@@ -57,6 +57,7 @@ Mention a clip with `@` or point at the playhead with `@playhead`. Every Magic e
 
 ### Works with AI agents
 - Claude and ChatGPT can edit an open project directly over MCP, with their own cursor on the timeline. Connect them in Settings › Magic; no API keys needed.
+- Any other agent that speaks MCP can too. [skills/editroom](skills/editroom) is a short guide for agents, with `connect.sh` to set up Codex, Claude Code or Hermes in one command and print a setup snippet for anything else.
 
 ## Requirements
 
